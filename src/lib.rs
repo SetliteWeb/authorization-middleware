@@ -1,14 +1,15 @@
 use actix_web::{
     dev::{Service, ServiceRequest, ServiceResponse, Transform},
-    Error, HttpMessage,
+    Error, HttpMessage, HttpResponse,
 };
 use futures::future::{ok, Ready, LocalBoxFuture};
 use reqwest::Client;
 use std::rc::Rc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use chrono::{NaiveDateTime};
+use chrono::NaiveDateTime;
 use std::env;
+use actix_web::body::EitherBody;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteUser {
@@ -31,7 +32,7 @@ where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     B: 'static,
 {
-    type Response = ServiceResponse<B>;
+    type Response = ServiceResponse<EitherBody<B>>;
     type Error = Error;
     type InitError = ();
     type Transform = AuthMiddlewareImpl<S>;
@@ -58,7 +59,7 @@ where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     B: 'static,
 {
-    type Response = ServiceResponse<B>;
+    type Response = ServiceResponse<EitherBody<B>>;
     type Error = Error;
     type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -88,49 +89,64 @@ where
                 }
             }
 
-            let user = if let Some(token) = token_opt {
-                let client = Client::new();
-                let api_url = env::var("AUTH_API_URL")
-                    .unwrap_or_else(|_| "http://localhost:8080/api/profile".to_string());
-
-                println!("→ Calling AUTH API: {} | Token: {}", api_url, token);
-
-                match client.get(&api_url)
-                    .header("Authorization", token.clone())
-                    .send()
-                    .await
-                {
-                    Ok(res) if res.status().is_success() => {
-                        match res.json::<RemoteUser>().await {
-                            Ok(user) => {
-                                println!("✅ Authenticated user: {:?}", user.username);
-                                Some(user)
-                            },
-                            Err(err) => {
-                                eprintln!("❌ Failed to parse user JSON: {:?}", err);
-                                None
-                            }
-                        }
-                    }
-                    Ok(res) => {
-                        eprintln!("❌ AUTH API error: {}", res.status());
-                        None
-                    }
-                    Err(err) => {
-                        eprintln!("❌ Failed to call AUTH API: {:?}", err);
-                        None
-                    }
+            // ❌ Reject immediately if no token found
+            let token = match token_opt {
+                Some(t) => t,
+                None => {
+                    eprintln!("⚠️ No Authorization header or cookie found");
+                    let response = HttpResponse::Unauthorized()
+                        .body("Unauthorized: Missing Authorization token")
+                        .map_into_right_body();
+                    return Ok(req.into_response(response));
                 }
-            } else {
-                eprintln!("⚠️ No Authorization header or cookie found");
-                None
             };
 
-            // Attach Option<RemoteUser> to request extensions
+            // ✅ Validate token via remote API
+            let client = Client::new();
+            let api_url = env::var("AUTH_API_URL")
+                .unwrap_or_else(|_| "http://localhost:8080/api/profile".to_string());
+
+            println!("→ Calling AUTH API: {} | Token: {}", api_url, token);
+
+            let user = match client
+                .get(&api_url)
+                .header("Authorization", token.clone())
+                .send()
+                .await
+            {
+                Ok(res) if res.status().is_success() => match res.json::<RemoteUser>().await {
+                    Ok(user) => {
+                        println!("✅ Authenticated user: {:?}", user.username);
+                        Some(user)
+                    }
+                    Err(err) => {
+                        eprintln!("❌ Failed to parse user JSON: {:?}", err);
+                        None
+                    }
+                },
+                Ok(res) => {
+                    eprintln!("❌ AUTH API error: {}", res.status());
+                    None
+                }
+                Err(err) => {
+                    eprintln!("❌ Failed to call AUTH API: {:?}", err);
+                    None
+                }
+            };
+
+            // ❌ Reject if user validation failed
+            if user.is_none() {
+                let response = HttpResponse::Unauthorized()
+                    .body("Unauthorized: Invalid or expired token")
+                    .map_into_right_body();
+                return Ok(req.into_response(response));
+            }
+
+            // ✅ Attach Option<RemoteUser> to request extensions
             req.extensions_mut().insert(user);
 
             // Continue request
-            let res = service.call(req).await?;
+            let res = service.call(req).await?.map_into_left_body();
             Ok(res)
         })
     }
