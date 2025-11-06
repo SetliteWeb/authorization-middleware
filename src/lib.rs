@@ -1,0 +1,137 @@
+use actix_web::{
+    dev::{Service, ServiceRequest, ServiceResponse, Transform},
+    Error, HttpMessage,
+};
+use futures::future::{ok, Ready, LocalBoxFuture};
+use reqwest::Client;
+use std::rc::Rc;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use chrono::{NaiveDateTime};
+use std::env;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteUser {
+    pub id: String,
+    pub created_at: Option<NaiveDateTime>,
+    pub deleted_at: Option<NaiveDateTime>,
+    pub updated_at: Option<NaiveDateTime>,
+    pub enabled: Option<bool>,
+    pub mobile: Option<String>,
+    pub phone_verified: Option<bool>,
+    pub username: String,
+    pub referral_code_id: Option<String>,
+    pub available_points: f64,
+}
+
+pub struct AuthMiddleware;
+
+impl<S, B> Transform<S, ServiceRequest> for AuthMiddleware
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type InitError = ();
+    type Transform = AuthMiddlewareImpl<S>;
+    type Future = Ready<Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        ok(AuthMiddlewareImpl {
+            service: Rc::new(service),
+        })
+    }
+}
+
+pub struct AuthMiddlewareImpl<S> {
+    service: Rc<S>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiResponse<T> {
+    pub data: T,
+}
+
+impl<S, B> Service<ServiceRequest> for AuthMiddlewareImpl<S>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &self,
+        ctx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(ctx)
+    }
+
+    fn call(&self, mut req: ServiceRequest) -> Self::Future {
+        let service = Rc::clone(&self.service);
+
+        Box::pin(async move {
+            // 🔍 Try header first
+            let mut token_opt: Option<String> = req
+                .headers()
+                .get("Authorization")
+                .and_then(|hv| hv.to_str().ok())
+                .map(|s| s.to_string());
+
+            // 🍪 If no Authorization header, check cookie
+            if token_opt.is_none() {
+                if let Some(cookie) = req.cookie("Authorization") {
+                    token_opt = Some(cookie.value().to_string());
+                    println!("🍪 Found Authorization cookie");
+                }
+            }
+
+            let user = if let Some(token) = token_opt {
+                let client = Client::new();
+                let api_url = env::var("AUTH_API_URL")
+                    .unwrap_or_else(|_| "http://localhost:8080/api/profile".to_string());
+
+                println!("→ Calling AUTH API: {} | Token: {}", api_url, token);
+
+                match client.get(&api_url)
+                    .header("Authorization", token.clone())
+                    .send()
+                    .await
+                {
+                    Ok(res) if res.status().is_success() => {
+                        match res.json::<RemoteUser>().await {
+                            Ok(user) => {
+                                println!("✅ Authenticated user: {:?}", user.username);
+                                Some(user)
+                            },
+                            Err(err) => {
+                                eprintln!("❌ Failed to parse user JSON: {:?}", err);
+                                None
+                            }
+                        }
+                    }
+                    Ok(res) => {
+                        eprintln!("❌ AUTH API error: {}", res.status());
+                        None
+                    }
+                    Err(err) => {
+                        eprintln!("❌ Failed to call AUTH API: {:?}", err);
+                        None
+                    }
+                }
+            } else {
+                eprintln!("⚠️ No Authorization header or cookie found");
+                None
+            };
+
+            // Attach Option<RemoteUser> to request extensions
+            req.extensions_mut().insert(user);
+
+            // Continue request
+            let res = service.call(req).await?;
+            Ok(res)
+        })
+    }
+}
