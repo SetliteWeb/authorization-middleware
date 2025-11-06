@@ -2,6 +2,16 @@
 name = "authorization-bridge"
 version = "0.1.0"
 edition = "2021"
+authors = ["David Macharia"]
+description = "An Actix Web middleware for authenticating HTTP requests through a remote API. It validates Authorization headers or cookies and attaches user info to requests."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/SetliteWeb/authorization-middleware"
+homepage = "https://github.com/SetliteWeb/authorization-middleware"
+documentation = "https://docs.rs/auth_middleware"
+keywords = ["actix-web", "middleware", "authentication", "web", "rust"]
+categories = ["web-programming::http-server", "authentication"]
+exclude = [".gitignore", ".github/*"]
 
 [dependencies]
 actix-web = "4"
