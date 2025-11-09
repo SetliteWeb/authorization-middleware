@@ -3,7 +3,7 @@ use actix_web::{
     Error, HttpMessage, HttpResponse,
 };
 use futures::future::{ok, Ready, LocalBoxFuture};
-use reqwest::Client;
+use reqwest::{Client, Method};
 use std::rc::Rc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -24,8 +24,17 @@ pub struct RemoteUser {
     pub referral_code_id: Option<String>,
     pub available_points: f64,
 }
+#[derive(Clone)]
+pub struct AuthMiddleware {
+    pub lax_paths: Vec<String>,
+    pub lax_methods: Vec<Method>,
+}
 
-pub struct AuthMiddleware;
+impl AuthMiddleware {
+    pub fn new(lax_paths: Vec<String>, lax_methods: Vec<Method>) -> Self {
+        Self { lax_paths, lax_methods }
+    }
+}
 
 impl<S, B> Transform<S, ServiceRequest> for AuthMiddleware
 where
@@ -41,17 +50,16 @@ where
     fn new_transform(&self, service: S) -> Self::Future {
         ok(AuthMiddlewareImpl {
             service: Rc::new(service),
+            lax_paths: self.lax_paths.clone(),
+            lax_methods: self.lax_methods.clone(),
         })
     }
 }
 
 pub struct AuthMiddlewareImpl<S> {
     service: Rc<S>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ApiResponse<T> {
-    pub data: T,
+    lax_paths: Vec<String>,
+    lax_methods: Vec<Method>,
 }
 
 impl<S, B> Service<ServiceRequest> for AuthMiddlewareImpl<S>
@@ -72,8 +80,21 @@ where
 
     fn call(&self, mut req: ServiceRequest) -> Self::Future {
         let service = Rc::clone(&self.service);
+        let lax_paths = self.lax_paths.clone();
+        let lax_methods = self.lax_methods.clone();
 
         Box::pin(async move {
+            let path = req.path();
+            let method = req.method();
+
+            // Skip auth if path or method matches lax rules
+            let is_lax_path = lax_paths.iter().any(|prefix| path.starts_with(prefix));
+            let is_lax_method = lax_methods.iter().any(|m| m == method);
+
+            if is_lax_path || is_lax_method {
+                return service.call(req).await.map(|res| res.map_into_left_body());
+            }
+
             // 🔍 Try header first
             let mut token_opt: Option<String> = req
                 .headers()
@@ -81,19 +102,16 @@ where
                 .and_then(|hv| hv.to_str().ok())
                 .map(|s| s.to_string());
 
-            // 🍪 If no Authorization header, check cookie
+            // 🍪 Fallback to cookie
             if token_opt.is_none() {
                 if let Some(cookie) = req.cookie("Authorization") {
                     token_opt = Some(cookie.value().to_string());
-                    println!("🍪 Found Authorization cookie");
                 }
             }
 
-            // ❌ Reject immediately if no token found
             let token = match token_opt {
                 Some(t) => t,
                 None => {
-                    eprintln!("⚠️ No Authorization header or cookie found");
                     let response = HttpResponse::Unauthorized()
                         .body("Unauthorized: Missing Authorization token")
                         .map_into_right_body();
@@ -101,12 +119,10 @@ where
                 }
             };
 
-            // ✅ Validate token via remote API
+            // Validate token via remote API
             let client = Client::new();
             let api_url = env::var("AUTH_API_URL")
                 .unwrap_or_else(|_| "http://localhost:8080/api/profile".to_string());
-
-            println!("→ Calling AUTH API: {} | Token: {}", api_url, token);
 
             let user = match client
                 .get(&api_url)
@@ -115,26 +131,12 @@ where
                 .await
             {
                 Ok(res) if res.status().is_success() => match res.json::<RemoteUser>().await {
-                    Ok(user) => {
-                        println!("✅ Authenticated user: {:?}", user.username);
-                        Some(user)
-                    }
-                    Err(err) => {
-                        eprintln!("❌ Failed to parse user JSON: {:?}", err);
-                        None
-                    }
+                    Ok(user) => Some(user),
+                    Err(_) => None,
                 },
-                Ok(res) => {
-                    eprintln!("❌ AUTH API error: {}", res.status());
-                    None
-                }
-                Err(err) => {
-                    eprintln!("❌ Failed to call AUTH API: {:?}", err);
-                    None
-                }
+                _ => None,
             };
 
-            // ❌ Reject if user validation failed
             if user.is_none() {
                 let response = HttpResponse::Unauthorized()
                     .body("Unauthorized: Invalid or expired token")
@@ -142,7 +144,7 @@ where
                 return Ok(req.into_response(response));
             }
 
-            // ✅ Attach Option<RemoteUser> to request extensions
+            // Attach user info to request extensions
             req.extensions_mut().insert(user);
 
             // Continue request
