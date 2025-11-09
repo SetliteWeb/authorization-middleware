@@ -91,7 +91,7 @@ where
             let is_lax_path = lax_paths.iter().any(|prefix| path.starts_with(prefix));
             let is_lax_method = lax_methods.iter().any(|m| m == method);
 
-            if is_lax_path || is_lax_method {
+            if is_lax_path && is_lax_method {
                 return service.call(req).await.map(|res| res.map_into_left_body());
             }
 

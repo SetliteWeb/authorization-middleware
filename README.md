@@ -23,7 +23,10 @@ async fn index() -> HttpResponse {
 async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new()
-            .wrap(AuthMiddleware)
+            .wrap(AuthMiddleware::new(
+    vec!["/public".to_string(), "/pub_api/".to_string()], // cover both
+    vec![Method::GET, Method::POST, Method::OPTIONS], // allow POST for uploads
+))
             .route("/", web::get().to(index))
     })
     .bind(("127.0.0.1", 8080))?
