@@ -1,6 +1,6 @@
 [package]
 name = "authorization-bridge"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["David Macharia"]
 description = "An Actix Web middleware for authenticating HTTP requests through a remote API. It validates Authorization headers or cookies and attaches user info to requests."
